@@ -37,6 +37,8 @@ pvLimit="50M"                  # default rate-limit for pv
 # Functions section
 #
 getHardwareData() {
+  serverModel=$(echo $(cat /sys/devices/virtual/dmi/id/sys_vendor /sys/devices/virtual/dmi/id/product_name))
+
   cpuModel=$(awk -F: '/^model name/ {print $2; exit}' /proc/cpuinfo)
   cpuCount=$(awk -F: '/^physical id/ { print $2 }' /proc/cpuinfo |sort -u |wc -l)
   cpuCoreCount=$(lscpu |grep "^CPU(s):" |xargs |cut -d" " -f2)
@@ -108,7 +110,7 @@ getPkgInfo() {
   [[ $(which slon) ]] && binSlon=$(which slon) || binSlon=""
   [[ $(which timedatectl) ]] && binTimedatectl=$(which timedatectl) || binTimedatectl=""
 
-  [[ -n $binPgbouncer ]] && pgbVersion=$($binPgbouncer --version |cut -d" " -f3) || pgbVersion=""
+  [[ -n $binPgbouncer ]] && pgbVersion=$($binPgbouncer --version |grep -iw pgbouncer | grep -oE '[[:digit:]]{1,}\.[[:digit:]]{1,}\.[[:digit:]]{1,}$') || pgbVersion=""
   [[ -n $binPgpool ]] && pgpVersion=$($binPgpool --version |cut -d" " -f3) || pgpVersion=""
   [[ -n $binPgqadm ]] && pgqaVersion=$($binPgqadm --version |cut -d" " -f3) || pgqaVersion=""
   [[ -n $binQadmin ]] && qadVersion=$($binQadmin --version |cut -d" " -f3) || qadVersion=""
@@ -149,7 +151,7 @@ getPostgresCommonData() {
   pgTblSpcList=$($psqlCmd -c "$pgGetTblSpcQuery" |awk -F: '{print $1" (size: "$3", location: "$2");"}' |xargs echo |sed -e 's/;$/\./g')
   pgDbNum=$($psqlCmd -c "select count(1) from pg_database")
   pgDbList=$($psqlCmd -c "$pgGetDbQuery" |awk -F: '{print $1" ("$5", "$2", "$3");"}' |xargs echo |sed -e 's/;$/\./g')
-  pgReplicaCount=$($psqlCmd -c "select count(*) from pg_stat_replication where application_name = 'walreceiver'")
+  pgReplicaCount=$($psqlCmd -c "select count(*) from pg_stat_replication")
   pgReplicaList=$($psqlCmd -c "select regexp_replace(regexp_replace(array_agg(ad)::text, '\"', '', 'g'), ',', ', ', 'g') from (select application_name || ': ' || array_agg(client_addr)::text ad from pg_stat_replication group by application_name order by application_name desc) c")
   pgRecoveryStatus=$($psqlCmd -c "select pg_is_in_recovery()")
   pgLogDir=$($psqlCmd -c "show log_directory")
@@ -168,6 +170,7 @@ getPostgresCommonData() {
 
 printSummary() {
   echo -e "${yellow}Hardware: summary${reset}
+  Server model:      $([[ -n $serverModel ]] && echo $serverModel || echo "${red}Can't understand.${reset}")
   Cpu:               $( [[ -n $cpuData ]] && echo $cpuData || echo "${red}Can't understand.${reset}")
   Numa node(s):      $([[ $numaNodes -gt 1 ]] && echo ${red}$numaNodes${reset} || echo "${green}$numaNodes${reset}")
   Memory:            $([[ -n $memData ]] && echo $memData || echo "${red}Can't understand.${reset}")
@@ -298,7 +301,7 @@ $( if [[ -n $pgAutoConfigFile ]]; then if [[ $pgAutoConfigNumLines -gt 0 ]]; the
   HBA configuration:         $pgHbaFile ($pgHbaAuthCnt)
   Log directory:             $(if [[ $(echo $pgLogDir |cut -c1) == "/" ]]; then echo "${green}$pgLogDir${reset}"; else echo "${red}$pgDataDir/$pgLogDir${reset}"; fi)
   Recovery?                  $pgRecoveryStatus
-  Replica count:             $pgReplicaCount -- $pgReplicaList
+  Streaming connections:     $pgReplicaCount -- $pgReplicaList
   NUMA policy:               $(if [[ -n $numaCurPolicy ]]; then if [[ $numaCurPolicy = *"interleave"* ]]; then echo -n "${green}$numaCurPolicy${reset}, $numaNodes node(s);"; else echo -n "${red}$numaCurPolicy${reset}, $numaNodes node(s);"; fi; \
                                else echo -n "numa_maps not found;"; fi;
                              echo -n " (vm.zone_reclaim_mode = $([[ $sVmZoneReclaim -eq 1 ]] && echo -n "${red}$sVmZoneReclaim${reset}," || echo -n "${green}$sVmZoneReclaim${reset},")"; 
@@ -391,12 +394,12 @@ while [[ $answer != "y" &&  $answer != "n" ]]
   done
 if [[ $answer == "y" ]]; then
     echo "${yellow}$pgConfigFile${reset}"
-    grep -oE "^[a-z_\.]+ = ('.*'|[a-z0-9A-Z\._-]+)" $pgConfigFile |sed -e 's/^/  /g'
+    grep -oE "^[a-z_\. ]+[ ]*=[ ]*('.*'|[a-z0-9A-Z._-]+)" $pgConfigFile |sed -e 's/^/  /g'
     echo ""
-    hardLineCnt=$(grep -c -oE "^[a-z_\.]+ = ('.*'|[a-z0-9A-Z\._-]+)" $pgConfigFile)
+    hardLineCnt=$(grep -c -oE "^[a-z_\. ]+[ ]*=[ ]*('.*'|[a-z0-9A-Z._-]+)" $pgConfigFile)
     softLineCnt=$(grep -c -oE "^[a-z]+" $pgConfigFile)
     if [[ $hardLineCnt -ne $softLineCnt ]]; then
-        echo "${red}  Don't trust me here. Regexp failure: lines found $softLineCnt, lines printed $hardLineCnt.${reset}"
+        echo "${red}  Don't trust me here. Regexp failure: lines found $softLineCnt, but only $hardLineCnt lines printed.${reset}"
     fi
 fi
 }
@@ -441,21 +444,21 @@ pgGetIndexTypes="SELECT
            WHEN (indexdef ~'USING gist') then 'gist'
            ELSE 'unknown'
        END, count(*)
-       FROM pg_indexes GROUP BY 1 ORDER BY 2"
+       FROM pg_indexes WHERE schemaname NOT IN ('pg_catalog') GROUP BY 1 ORDER BY 2"
 pgGetFuncTypes="SELECT l.lanname,count(*)
        FROM pg_proc p
        LEFT JOIN pg_language l ON p.prolang = l.oid
        LEFT JOIN pg_namespace n ON n.oid = p.pronamespace
-       WHERE n.nspname NOT IN ('information_schema','pg_catalog','pg_toast') GROUP BY 1 ORDER BY 2 DESC;"
+       WHERE n.nspname NOT IN ('information_schema','pg_catalog','pg_toast') GROUP BY 1 ORDER BY 2 DESC"
 
 pgDbProperties=$($psqlCmd2 -c "$pgGetDbProperties" |awk -F: '{print $1" (owner: "$2", encoding: "$3", collate: "$4", ctype: "$5", size: "$6", tablespace: "$7");"}' |xargs echo |sed -e 's/;$/\./g')
 pgDbGetNspNum=$($psqlCmd2 -c "SELECT count(1) FROM pg_catalog.pg_namespace WHERE nspname !~ '^pg_' AND nspname <> 'information_schema'")
 pgGetNspList=$($psqlCmd2 -c "$pgGetNspList" |awk -F: '{print $1"; "}' |xargs echo |sed -e 's/;$/\./g')
 pgDbGetRelNum=$($psqlCmd2 -c "SELECT count(1) FROM pg_catalog.pg_stat_user_tables")
 pgLargestRelsList=$($psqlCmd2 -c "$pgGetLargestRels" |awk -F: '{print $1" (size: "$2");"}' |xargs echo |sed -e 's/;$/\./g')
-pgGetIdxNum=$($psqlCmd2 -c "SELECT count(1) FROM pg_catalog.pg_stat_user_indexes")
+pgGetIdxNum=$($psqlCmd2 -c "SELECT count(1) FROM pg_catalog.pg_indexes WHERE schemaname NOT IN ('pg_catalog')")
 pgGetIdxTypesList=$($psqlCmd2 -c "$pgGetIndexTypes" |awk -F: '{print $1" "$2";"}' |xargs echo |sed -e 's/;$/\./g')
-pgGetFuncNum=$($psqlCmd2 -c "SELECT count(1) FROM pg_catalog.pg_stat_user_functions")
+pgGetFuncNum=$($psqlCmd2 -c "SELECT count(1) FROM pg_catalog.pg_proc LEFT JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname NOT IN ('information_schema','pg_catalog','pg_toast')")
 pgGetFuncList=$($psqlCmd2 -c "$pgGetFuncTypes" |awk -F: '{print $1" "$2";"}' |xargs echo |sed -e 's/;$/\./g')
 pgGetInhNum=$($psqlCmd2 -c "$pgGetInheritanceInfo" |awk -F: '{print $1" parent tables with "$2" child tables."}' |xargs echo)
 

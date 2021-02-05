@@ -12,18 +12,18 @@ with pg_stat_statements_normalized as (
     E'\r', '')
     as query_normalized
     --if current database is postgres then generate report for all databases otherwise generate for current database only
-    from pg_stat_statements where dbid in (SELECT oid from pg_database where current_database() = 'postgres' or datname=current_database())
+    from pg_stat_statements where current_database() = 'postgres' or dbid in (SELECT oid from pg_database where datname=current_database())
 ),
 totals as (
     select sum(total_time) AS total_time, sum(blk_read_time+blk_write_time) as io_time,
     sum(total_time-blk_read_time-blk_write_time) as cpu_time, sum(calls) AS ncalls,
     sum(rows) as total_rows FROM pg_stat_statements
-    WHERE dbid in (SELECT oid from pg_database where current_database() = 'postgres' or datname=current_database())
+    WHERE current_database() = 'postgres' or dbid in (SELECT oid from pg_database where datname=current_database())
 ),
 _pg_stat_statements as (
     select
-    (select datname from pg_database where oid = p.dbid) as database,
-    (select rolname from pg_roles where oid = p.userid) as username,
+    coalesce((select datname from pg_database where oid = p.dbid), 'unknown') as database,
+    coalesce((select rolname from pg_roles where oid = p.userid), 'unknown') as username,
     --select shortest query, replace \n\n-- strings to avoid email clients format text as footer
     substring(
     translate(
@@ -37,7 +37,7 @@ _pg_stat_statements as (
     sum(blk_read_time) as blk_read_time, sum(blk_write_time) as blk_write_time,
     sum(calls) as calls, sum(rows) as rows
     from pg_stat_statements_normalized p
-    where TRUE
+    where calls > 0
     group by dbid, userid, md5(query_normalized)
 ),
 totals_readable as (
@@ -108,6 +108,6 @@ union all
 (select E'=============================================================================================================\n' ||
 'pos:' || pos || E'\t total time: ' || total_time || ' (' || time_percent || ', CPU: ' || cpu_time_percent || ', IO: ' || io_time_percent || E')\t calls: ' || calls ||
 ' (' || calls_percent || E'%)\t avg_time: ' || avg_time || 'ms (IO: ' || avg_io_time_percent || E')\n' ||
-'user: ' || username || E'\t db: ' || database || E'\t rows: ' || rows || ' (' || row_percent || '%)' || E'\t query:\n' || query || E'\n'
+'user: ' || username || E'\t db: ' || database || E'\t rows: ' || rows || ' (' || row_percent || '%)' || E'\t query:\n' || coalesce(query, 'unknown') || E'\n'
 
 from statements_readable order by pos);
